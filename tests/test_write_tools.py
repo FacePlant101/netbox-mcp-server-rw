@@ -529,10 +529,13 @@ def test_branch_that_is_not_ready_is_not_cached(mock_netbox):
 @patch("netbox_mcp_server.server.netbox")
 def test_name_shadowing_a_schema_id_is_ambiguous(mock_netbox):
     impostor = {**READY, "id": 9, "name": "abcd1234", "schema_id": "eeee1111"}
-    mock_netbox.get.side_effect = [_branches(impostor), _branches(READY)]
+    mock_netbox.get.side_effect = [_branches(impostor, READY)]
     with pytest.raises(ValueError, match="found 2"):
         netbox_create_objects("dcim.site", "abcd1234", {"name": "x", "slug": "x"})
     mock_netbox.create.assert_not_called()
+    # netbox-branching has no schema_id filter: one unfiltered listing, not two queries
+    assert mock_netbox.get.call_count == 1
+    assert "name" not in mock_netbox.get.call_args.kwargs["params"]
 
 
 @patch("netbox_mcp_server.server.netbox")
@@ -575,12 +578,17 @@ def test_list_branches_without_known_user_still_lists(mock_netbox):
 
 
 @patch("netbox_mcp_server.server.netbox")
-def test_search_in_branch_surfaces_branch_errors(mock_netbox):
-    """Detected by re-checking the branch, not by matching the (translatable) message."""
+@pytest.mark.parametrize("status", [500, 400])
+def test_search_in_branch_surfaces_branch_errors(mock_netbox, status):
+    """Detected by re-checking the branch, not by matching the (translatable) message.
+
+    netbox-branching 1.1.3 answers 500 for a branch that isn't ready (e.g. merged while
+    still cached as ready here), 400 for an unknown one.
+    """
     merged_now = {**READY, "status": {"value": "merged"}}
     mock_netbox.get.side_effect = [
         _branches(READY),
-        _http_error(400, "Valgt gren er ikke klar."),
+        _http_error(status, "Selected branch is not ready."),
         _branches(merged_now),
     ]
     with pytest.raises(ValueError, match="has status 'merged'"):
@@ -650,12 +658,12 @@ def test_search_on_main_still_skips_http_errors(mock_netbox):
 
 
 @patch("netbox_mcp_server.server.netbox")
-def test_search_400_in_ready_branch_is_skipped_and_rechecked_once(mock_netbox):
+def test_search_error_in_ready_branch_is_skipped_and_rechecked_once(mock_netbox):
     mock_netbox.get.side_effect = [
         _branches(READY),
         _http_error(400, "bad query"),
         _branches(READY),
-        _http_error(400, "bad query"),
+        _http_error(500, "type-specific failure"),
         {"results": [{"id": 1}]},
     ]
     result = netbox_search_objects(

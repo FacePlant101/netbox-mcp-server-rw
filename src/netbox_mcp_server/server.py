@@ -674,12 +674,14 @@ def netbox_search_objects(
             # Extract results array from paginated response
             results[obj_type] = response.get("results", [])
         except httpx.HTTPStatusError as e:
-            # In a branch, a 400 may mean the branch stopped being usable (e.g. merged
-            # mid-search), and empty results would wrongly suggest no matches. The plugin's
-            # message is translatable, so re-check the branch itself once (bypassing the
-            # cache); _resolve_branch raises if it is no longer ready. Other per-type
+            # In a branch, an error may mean the branch stopped being usable (e.g. merged
+            # mid-search, or while cached as ready): netbox-branching 1.1.3 answers 500
+            # for a branch that isn't ready, 400 for an unknown one. Empty results would
+            # wrongly suggest no matches, so re-check the branch itself once (bypassing
+            # the cache); _resolve_branch raises if it is no longer ready. Other per-type
             # errors are skipped as on main.
-            if branch and e.response.status_code == 400 and not branch_rechecked:
+            status = e.response.status_code
+            if branch and (status == 400 or status >= 500) and not branch_rechecked:
                 branch_rechecked = True
                 branch_policy.cache.pop(branch.strip(), None)
                 _resolve_branch(branch, for_write=False)
@@ -750,8 +752,8 @@ BRANCH_FIELDS = "id,name,schema_id,status,owner"
 BRANCH_CACHE_TTL = 60.0
 
 # NetBox Branching schema IDs are eight lowercase alphanumeric characters. Inputs of this
-# shape are looked up both by name and by schema ID (an extra query for names like
-# "backbone" until cached), so a name can never shadow another branch's schema ID.
+# shape are matched by both name and schema ID, so a name can never shadow another
+# branch's schema ID.
 SCHEMA_ID_PATTERN = re.compile(r"[a-z0-9]{8}")
 
 # How long a failed lookup of the token's user is remembered before retrying
@@ -805,14 +807,37 @@ def _branch_status(found: dict) -> str | None:
     return status.get("value") if isinstance(status, dict) else status
 
 
-def _find_branches(params: dict) -> list[dict]:
-    """Fetch every page of branches matching params (only the fields needed to resolve)."""
+def _get_all(
+    endpoint: str,
+    params: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    client: NetBoxRestClient | None = None,
+    fallback_endpoint: str | None = None,
+) -> list[dict]:
+    """Every result of a NetBox list request, following its offset pagination.
+
+    NetBox may cap the page size (MAX_PAGE_SIZE) below the requested limit, so pages are
+    followed until "next" is empty.
+
+    Args:
+        endpoint: API endpoint, e.g. "dcim/devices"
+        params: Query parameters (filters, fields, limit); offset is added per page
+        headers: Optional extra request headers (e.g. X-NetBox-Branch)
+        client: NetBox client to use (default: the server's client)
+        fallback_endpoint: Optional endpoint to try if the primary returns 404
+
+    Raises:
+        httpx.HTTPStatusError: If NetBox returns an error status.
+    """
+    client = client or netbox
     results: list[dict] = []
     offset = 0
     while True:
-        page = netbox.get(
-            BRANCHES_ENDPOINT,
-            params={**params, "fields": BRANCH_FIELDS, "limit": 1000, "offset": offset},
+        page = client.get(
+            endpoint,
+            params={**params, "offset": offset},
+            headers=headers,
+            fallback_endpoint=fallback_endpoint,
         )
         batch = list(page.get("results") or [])
         results.extend(batch)
@@ -821,21 +846,28 @@ def _find_branches(params: dict) -> list[dict]:
         offset += len(batch)
 
 
+def _find_branches(params: dict) -> list[dict]:
+    """Fetch every page of branches matching params (only the fields needed to resolve)."""
+    return _get_all(BRANCHES_ENDPOINT, {**params, "fields": BRANCH_FIELDS, "limit": 1000})
+
+
 def _lookup_branch(branch: str) -> dict:
     """Find the single branch whose name or schema ID is exactly `branch`."""
     cached = branch_policy.cache.get(branch)
     if cached and time.monotonic() - cached[0] < BRANCH_CACHE_TTL:
         return cached[1]
     try:
-        # Filter server-side, but match exactly on the client side so an ignored
-        # query filter can never select the wrong branch. Names are the common case;
-        # anything shaped like a schema ID is also checked as one, so a branch *named*
-        # like another branch's schema ID is reported as ambiguous instead of winning.
-        matches = {b["id"]: b for b in _find_branches({"name": branch}) if b.get("name") == branch}
-        if not matches or SCHEMA_ID_PATTERN.fullmatch(branch):
-            for b in _find_branches({"schema_id": branch}):
-                if b.get("schema_id") == branch:
-                    matches[b["id"]] = b
+        # netbox-branching has no schema_id filter, so input shaped like a schema ID is
+        # matched against every branch, by name and schema ID at once: a branch *named*
+        # like another branch's schema ID is then ambiguous instead of winning. Other
+        # input can only be a name; it is filtered server-side, but still matched exactly
+        # here so an ignored filter can never select the wrong branch.
+        params = {} if SCHEMA_ID_PATTERN.fullmatch(branch) else {"name": branch}
+        matches = {
+            b["id"]: b
+            for b in _find_branches(params)
+            if branch in (b.get("name"), b.get("schema_id"))
+        }
     except httpx.HTTPStatusError as e:
         _raise_branching_error(e)
     if len(matches) != 1:
@@ -1317,22 +1349,13 @@ def _fetch_dependent_rows(
         # In chunks, to keep the request line within server limits (gunicorn: 4094 bytes)
         types = sorted(branch_policy.branchable_types)
         filters = [{"object_type": types[i : i + 40]} for i in range(0, len(types), 40)]
-    rows: list[tuple[str, int]] = []
     try:
-        for extra in filters:
-            offset = 0
-            while True:
-                page = netbox.get(endpoint, params={**params, **extra, "offset": offset})
-                batch = list(page.get("results") or [])
-                rows.extend(
-                    (row["object_type"], row["object_id"])
-                    for row in batch
-                    if row.get("object_type") and row.get("object_id") is not None
-                )
-                if not page.get("next") or not batch:
-                    break
-                offset += len(batch)
-        return rows
+        return [
+            (row["object_type"], row["object_id"])
+            for extra in filters
+            for row in _get_all(endpoint, {**params, **extra})
+            if row.get("object_type") and row.get("object_id") is not None
+        ]
     except httpx.HTTPStatusError as e:
         # Every NetBox version netbox-branching supports has these endpoints, so even a
         # 404 means the check can't be trusted (e.g. a proxy blocking the path)
@@ -1400,24 +1423,14 @@ def _fetch_by_ids(endpoint: str, ids: list[int], headers: dict[str, str] | None)
     for start in range(0, len(ids), 100):
         chunk = ids[start : start + 100]
         wanted = set(chunk)
-        offset = 0
-        while True:  # NetBox may cap the page size (MAX_PAGE_SIZE) below the chunk
-            try:
-                page = netbox.get(
-                    endpoint,
-                    params={"id": chunk, "limit": len(chunk), "offset": offset},
-                    headers=headers,
-                )
-            except httpx.HTTPStatusError as e:
-                raise ValueError(
-                    f"Can't check the {endpoint} objects this write affects (NetBox returned "
-                    f"{e.response.status_code}); refusing."
-                ) from e
-            batch = list(page.get("results") or [])
-            found.extend(obj for obj in batch if obj.get("id") in wanted)
-            if not page.get("next") or not batch:
-                break
-            offset += len(batch)
+        try:
+            batch = _get_all(endpoint, {"id": chunk, "limit": len(chunk)}, headers)
+        except httpx.HTTPStatusError as e:
+            raise ValueError(
+                f"Can't check the {endpoint} objects this write affects (NetBox returned "
+                f"{e.response.status_code}); refusing."
+            ) from e
+        found.extend(obj for obj in batch if obj.get("id") in wanted)
     return found
 
 
@@ -1498,22 +1511,14 @@ def _hidden_dependents(objects: set[ObjectRef], headers: dict[str, str]) -> set[
         for holder, link_filter in HIDDEN_CASCADES[endpoint]:
             for start in range(0, len(ids), 100):
                 params = {link_filter: ids[start : start + 100], "fields": "id", "limit": 1000}
-                offset = 0
-                while True:
-                    try:
-                        page = netbox.get(
-                            holder, params={**params, "offset": offset}, headers=headers
-                        )
-                    except httpx.HTTPStatusError as e:
-                        raise ValueError(
-                            f"Can't check which {holder} objects would be deleted along with "
-                            f"these objects (NetBox returned {e.response.status_code}); refusing."
-                        ) from e
-                    batch = list(page.get("results") or [])
-                    found.update((holder, row["id"]) for row in batch)
-                    if not page.get("next") or not batch:
-                        break
-                    offset += len(batch)
+                try:
+                    rows = _get_all(holder, params, headers)
+                except httpx.HTTPStatusError as e:
+                    raise ValueError(
+                        f"Can't check which {holder} objects would be deleted along with "
+                        f"these objects (NetBox returned {e.response.status_code}); refusing."
+                    ) from e
+                found.update((holder, row["id"]) for row in rows)
     return found
 
 
@@ -1747,23 +1752,11 @@ def _check_event_rules() -> None:
         "event rules",
         "Event rules fire for changes made inside branches, so the write is refused.",
     )
-    rules: list[dict] = []
-    offset = 0
     try:
-        while True:
-            page = netbox.get(
-                "extras/event-rules",
-                params={
-                    "fields": "id,name,enabled,object_types,conditions",
-                    "limit": 1000,
-                    "offset": offset,
-                },
-            )
-            batch = list(page.get("results") or [])
-            rules.extend(batch)
-            if not page.get("next") or not batch:
-                break
-            offset += len(batch)
+        rules = _get_all(
+            "extras/event-rules",
+            {"fields": "id,name,enabled,object_types,conditions", "limit": 1000},
+        )
     except httpx.HTTPStatusError as e:
         raise ValueError(
             f"Can't check NetBox event rules (GET /api/extras/event-rules/ returned "
@@ -1966,24 +1959,19 @@ def discover_branchable_types(client: NetBoxRestClient) -> dict[str, str | None]
     """
     logger = logging.getLogger(__name__)
     types: dict[str, str | None] = {}
-    offset = 0
     try:
-        while True:
-            page = client.get(
-                "core/object-types",
-                params={"features": "branching", "limit": 1000, "offset": offset},
-                fallback_endpoint="extras/object-types",  # NetBox < 4.4
-            )
-            batch = list(page.get("results") or [])
-            for obj_type in batch:
-                if "branching" not in (obj_type.get("features") or []):
-                    continue
-                if obj_type.get("app_label") and obj_type.get("model"):
-                    name = f"{obj_type['app_label']}.{obj_type['model']}"
-                    types[name] = _rest_endpoint(obj_type.get("rest_api_endpoint"))
-            if not page.get("next") or not batch:
-                break
-            offset += len(batch)
+        object_types = _get_all(
+            "core/object-types",
+            {"features": "branching", "limit": 1000},
+            client=client,
+            fallback_endpoint="extras/object-types",  # NetBox < 4.4
+        )
+        for obj_type in object_types:
+            if "branching" not in (obj_type.get("features") or []):
+                continue
+            if obj_type.get("app_label") and obj_type.get("model"):
+                name = f"{obj_type['app_label']}.{obj_type['model']}"
+                types[name] = _rest_endpoint(obj_type.get("rest_api_endpoint"))
     except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as e:
         logger.warning(f"Couldn't read branchable models from NetBox, using static list: {e}")
         return None

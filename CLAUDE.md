@@ -170,12 +170,13 @@ See `NETBOX_OBJECT_TYPES` in `server.py` for complete list.
 ## Environment Variables
 
 - `NETBOX_URL`: Base URL of NetBox instance (e.g., `https://netbox.example.com/`)
-- `NETBOX_TOKEN`: Read-only API token with appropriate permissions
+- `NETBOX_TOKEN`: API token; read-only unless `ENABLE_WRITE` is set
+- `ENABLE_WRITE` and the other write-mode settings: see `.env.example` and README "Branch-Only Writes"
 - `LOG_LEVEL`: Logging verbosity (default: `INFO`, options: `DEBUG`, `WARNING`, `ERROR`)
 
 ## Security Considerations
 
-- **Read-only tokens**: Always use read-only API tokens with minimal required permissions
+- **Token permissions**: Without `ENABLE_WRITE`, use a read-only token with minimal required permissions. Write mode needs a write-capable token whose user can view everything without permission constraints (e.g. a superuser), confirmed with `UNRESTRICTED_TOKEN`, because the side-effect checks must see every user's event rules, bookmarks, subscriptions and jobs
 - **No credential storage**: Tokens passed via environment, never stored or logged
 - **SSL verification**: Enabled by default in REST client
 - **No plugin support**: Deliberately excludes plugin object types to limit attack surface
