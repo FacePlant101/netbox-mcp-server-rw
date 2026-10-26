@@ -741,8 +741,9 @@ BRANCH_CACHE_TTL = 60.0
 
 # NetBox Branching schema IDs are eight lowercase alphanumeric characters. Inputs of this
 # shape are matched by both name and schema ID, so a name can never shadow another
-# branch's schema ID.
+# branch's schema ID. The column holds at most 8 characters in any format.
 SCHEMA_ID_PATTERN = re.compile(r"[a-z0-9]{8}")
+SCHEMA_ID_MAX_LENGTH = 8
 
 # How long a failed lookup of the token's user is remembered before retrying
 USER_LOOKUP_RETRY_SECONDS = 60.0
@@ -805,8 +806,9 @@ def _get_all(
     """Every result of a NetBox list request, following its offset pagination.
 
     NetBox may cap the page size (MAX_PAGE_SIZE) below the requested limit, so pages are
-    followed until "next" is empty, or "count" results are in (bounding the loop if a
-    proxy ignores the offset).
+    followed until "next" is empty. Every row must carry an "id": a page that adds no
+    new id (e.g. a proxy ignoring the offset and repeating a page) is refused, since the
+    callers' safety checks must not pass on a partial list.
 
     Args:
         endpoint: API endpoint, e.g. "dcim/devices"
@@ -817,9 +819,11 @@ def _get_all(
 
     Raises:
         httpx.HTTPStatusError: If NetBox returns an error status.
+        ValueError: If a page repeats earlier rows, so the full list can't be read.
     """
     client = client or netbox
     results: list[dict] = []
+    seen: set[Any] = set()
     offset = 0
     while True:
         page = client.get(
@@ -829,11 +833,17 @@ def _get_all(
             fallback_endpoint=fallback_endpoint,
         )
         batch = list(page.get("results") or [])
+        ids = {row.get("id") for row in batch}
+        if batch and ids <= seen:
+            raise ValueError(
+                f"NetBox returned the same page of /api/{endpoint}/ again (is a proxy "
+                "ignoring the 'offset' parameter?), so the full list can't be read; refusing."
+            )
+        seen |= ids
         results.extend(batch)
-        offset += len(batch)
-        count = page.get("count")
-        if not page.get("next") or not batch or (isinstance(count, int) and offset >= count):
+        if not page.get("next") or not batch:
             return results
+        offset += len(batch)
 
 
 def _find_branches(params: dict) -> list[dict]:
@@ -852,11 +862,14 @@ def _lookup_branch(branch: str) -> dict:
         # like another branch's schema ID is then ambiguous instead of winning. Other
         # input is looked up by name (filtered server-side, matched exactly here so an
         # ignored filter can never select the wrong branch), and if no branch has that
-        # name, against every branch in case it is a schema ID of another format.
+        # name and it is short enough, against every branch in case it is a schema ID of
+        # another format.
         candidates: list[dict] = []
         if not SCHEMA_ID_PATTERN.fullmatch(branch):
             candidates = _find_branches({"name": branch})
-        if not any(b.get("name") == branch for b in candidates):
+        if len(branch) <= SCHEMA_ID_MAX_LENGTH and not any(
+            b.get("name") == branch for b in candidates
+        ):
             candidates = _find_branches({})
         matches = {b["id"]: b for b in candidates if branch in (b.get("name"), b.get("schema_id"))}
     except httpx.HTTPStatusError as e:

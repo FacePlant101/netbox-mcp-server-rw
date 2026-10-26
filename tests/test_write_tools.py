@@ -722,13 +722,13 @@ def test_reads_in_a_ready_branch_still_raise_their_own_errors(mock_netbox):
         netbox_get_object_by_id("dcim.site", 999, branch="my-branch")
 
 
-@pytest.mark.parametrize("branch", ["backbone", "BRANCH-ID-OTHER-FORMAT"])
+@pytest.mark.parametrize("branch", ["backbone", "AB-12"])
 @patch("netbox_mcp_server.server.netbox")
 def test_branch_resolves_by_schema_shaped_name_or_other_schema_id_format(mock_netbox, branch):
     """'backbone' is a name shaped like a schema ID; the other is a schema ID of another
     format, found by the fallback listing when no branch has that name."""
     shaped = {**READY, "name": "backbone", "schema_id": "zzzz0000"}
-    odd = {**READY, "id": 5, "name": "odd", "schema_id": "BRANCH-ID-OTHER-FORMAT"}
+    odd = {**READY, "id": 5, "name": "odd", "schema_id": "AB-12"}
     mock_netbox.get.side_effect = lambda endpoint, params=None, **kw: (
         _branches(*[b for b in (shaped, odd) if b["name"] == params["name"]])
         if params and "name" in params
@@ -737,16 +737,28 @@ def test_branch_resolves_by_schema_shaped_name_or_other_schema_id_format(mock_ne
         else {"next": None, "results": []}
     )
     netbox_create_objects("dcim.site", branch, {"name": "x", "slug": "x"})
-    expected = "zzzz0000" if branch == "backbone" else "BRANCH-ID-OTHER-FORMAT"
+    expected = "zzzz0000" if branch == "backbone" else "AB-12"
     assert mock_netbox.create.call_args.kwargs["branch"] == expected
 
 
-def test_get_all_stops_at_count_when_offset_is_ignored():
-    """A proxy that ignores offset returns the same page forever; count bounds the loop."""
+def test_get_all_refuses_a_repeated_page():
+    """A proxy that ignores offset repeats page 1: refuse rather than return partial data."""
     client = MagicMock()
     client.get.return_value = {"count": 3, "next": "https://nb/next", "results": [{"id": 1}]}
-    assert len(server._get_all("dcim/sites", {"limit": 1}, client=client)) == 3
-    assert client.get.call_count == 3
+    with pytest.raises(ValueError, match="same page"):
+        server._get_all("dcim/sites", {"limit": 1}, client=client)
+    assert client.get.call_count == 2
+
+
+@patch("netbox_mcp_server.server.netbox")
+def test_event_rule_check_refuses_when_pages_repeat(mock_netbox):
+    rule_page = {"count": 2, "next": "https://nb/next", "results": [DEVICE_RULE]}
+    mock_netbox.get.side_effect = lambda endpoint, **kw: (
+        rule_page if endpoint == "extras/event-rules" else _branches(READY)
+    )
+    with pytest.raises(ValueError, match="same page"):
+        netbox_create_objects("dcim.site", "my-branch", {"name": "x", "slug": "x"})
+    mock_netbox.create.assert_not_called()
 
 
 # ============================================================================
@@ -1996,3 +2008,12 @@ def test_module_bay_subtree_is_walked_downward(mock_netbox, deleted, hidden):
     with pytest.raises(ValueError, match="main has 1 bookmarks"):
         netbox_delete_objects(deleted[0], "my-branch", deleted[1])
     mock_netbox.delete.assert_not_called()
+
+
+@patch("netbox_mcp_server.server.netbox")
+def test_unknown_long_branch_name_is_not_looked_up_as_schema_id(mock_netbox):
+    """Schema IDs are at most 8 characters, so a longer unknown name needs one query."""
+    mock_netbox.get.return_value = _branches()
+    with pytest.raises(ValueError, match="found 0"):
+        netbox_create_objects("dcim.site", "my-typoed-branch", {"name": "x", "slug": "x"})
+    assert mock_netbox.get.call_count == 1
