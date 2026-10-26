@@ -2,11 +2,11 @@
 
 import logging
 import logging.config
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import AnyUrl, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -54,6 +54,30 @@ class Settings(BaseSettings):
     enable_plugin_discovery: bool = False
     """Whether to auto-discover plugin object types from NetBox at startup"""
 
+    enable_write: bool = False
+    """Whether to expose create/update/delete tools (requires a write-capable token)"""
+
+    allow_foreign_branches: bool = False
+    """Whether write tools may target branches owned by other users"""
+
+    allow_branch_events: bool = False
+    """Whether branch writes may proceed while NetBox would react to them in main
+    (enabled event rules, subscriber notifications)"""
+
+    allowed_branch_event_rules: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    """IDs of event rules that are safe to fire on branch changes
+    (comma-separated in the environment)"""
+
+    unrestricted_token: bool = False
+    """Whether the API token's user can view everything without permission constraints
+    (e.g. a superuser). NetBox silently filters API lists by constraints (by default users
+    see only their own bookmarks and subscriptions) and the API can't tell, so the checks
+    that read event rules, bookmarks, subscriptions and jobs refuse until this is set"""
+
+    netbox_username: str | None = None
+    """Username of the API token's user; needed for branch ownership on NetBox < 4.5,
+    which can't report it (newer versions ask NetBox and ignore this)"""
+
     # ===== Security Settings =====
     verify_ssl: bool = True
     """Whether to verify SSL certificates when connecting to NetBox"""
@@ -94,6 +118,23 @@ class Settings(BaseSettings):
         if v is not None and not v.get_secret_value().strip():
             return None
         return v
+
+    @field_validator("allowed_branch_event_rules", mode="before")
+    @classmethod
+    def split_event_rules(cls, v: object) -> object:
+        """Accept comma-separated IDs, as one string (environment) or a list of them (CLI)."""
+        items = [v] if isinstance(v, str) else v
+        if not isinstance(items, list):
+            return v
+        return [part.strip() for item in items for part in str(item).split(",") if part.strip()]
+
+    @field_validator("netbox_username", mode="after")
+    @classmethod
+    def normalize_username(cls, v: str | None) -> str | None:
+        """Treat an empty or whitespace-only username as unset."""
+        if v is None or not v.strip():
+            return None
+        return v.strip()
 
     @field_validator("netbox_url")
     @classmethod
@@ -137,6 +178,12 @@ class Settings(BaseSettings):
             "transport": self.transport,
             "verify_ssl": self.verify_ssl,
             "enable_plugin_discovery": self.enable_plugin_discovery,
+            "enable_write": self.enable_write,
+            "allow_foreign_branches": self.allow_foreign_branches,
+            "allow_branch_events": self.allow_branch_events,
+            "allowed_branch_event_rules": self.allowed_branch_event_rules,
+            "unrestricted_token": self.unrestricted_token,
+            "netbox_username": self.netbox_username,
             "log_level": self.log_level,
         }
         if self.transport == "http":

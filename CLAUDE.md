@@ -2,7 +2,9 @@
 
 ## Core Concept
 
-A read-only [Model Context Protocol](https://modelcontextprotocol.io/) server that enables LLMs to interact with NetBox infrastructure data. Built with FastMCP and designed for use by NetBox operators.
+A [Model Context Protocol](https://modelcontextprotocol.io/) server that enables LLMs to interact with NetBox infrastructure data. Built with FastMCP and designed for use by NetBox operators.
+
+This is a fork of netboxlabs/netbox-mcp-server (`upstream` remote). It is read-only by default; with `ENABLE_WRITE=true` it adds **branch-only** write tools that stage changes in [NetBox Branching](https://github.com/netboxlabs/netbox-branching) branches and never write to main. Branch-only writes are in scope for this fork: keep the guarantees in the "Branch-only writes" pattern below when changing them.
 
 **Your role**: Help contributors design and implement features within the project's stated scope (see [CONTRIBUTING.md](CONTRIBUTING.md)). Challenge proposals that fall outside scope before implementation begins, not after. Ask clarifying questions and challenge assumptions when needed.
 
@@ -91,7 +93,7 @@ This project uses [python-semantic-release](https://python-semantic-release.read
 
 - **Type hints required**: All function parameters and return types must be annotated
 - **Docstrings**: Use Google-style docstrings for all public functions and classes
-- **Line length**: 88 characters maximum (Ruff/Black standard)
+- **Line length**: 100 characters maximum (`line-length` in pyproject.toml)
 - **Naming conventions**:
   - Functions and variables: `snake_case`
   - Classes: `PascalCase`
@@ -131,7 +133,7 @@ def get_stuff(t, f):
 ### Architecture Patterns
 
 - **Abstraction layer**: `NetBoxClientBase` defines interface for future ORM implementation
-- **Read-only by design**: Only GET operations exposed; no create/update/delete tools
+- **Read-only by default, branch-only writes**: Without `ENABLE_WRITE` only GET operations are exposed. With it, create/update/delete tools write only inside a ready NetBox Branching branch owned by the token's user. The client refuses any write without a branch (except creating a branch) and any endpoint that branching doesn't isolate. There is deliberately no merge tool: people review and merge in the NetBox UI
 - **Environment-based config**: All secrets via environment variables, never hardcoded
 - **Explicit object mapping**: `NETBOX_OBJECT_TYPES` dictionary maintains allowed types
 

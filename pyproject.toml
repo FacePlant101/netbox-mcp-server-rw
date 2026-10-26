@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "netbox-mcp-server"
+name = "netbox-mcp-server-rw"
 version = "1.2.2"
-description = "A read-only MCP server for NetBox"
+description = "NetBox MCP server, read-only by default with branch-only writes (fork of netbox-mcp-server)"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [
@@ -17,6 +17,10 @@ dependencies = [
 
 [project.scripts]
 netbox-mcp-server = "netbox_mcp_server.server:main"
+
+[tool.hatch.build.targets.wheel]
+# The distribution is renamed (netbox-mcp-server-rw) but the import package keeps its name
+packages = ["src/netbox_mcp_server"]
 
 [dependency-groups]
 dev = [

@@ -7,7 +7,7 @@
 > - Docker users: rebuild images with updated CMD
 > - See [CHANGELOG.md](CHANGELOG.md) for full details
 
-This is a simple read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for NetBox. It enables you to interact with your data in NetBox directly via LLMs that support MCP.
+This is a [Model Context Protocol](https://modelcontextprotocol.io/) server for NetBox, forked from [netboxlabs/netbox-mcp-server](https://github.com/netboxlabs/netbox-mcp-server). It enables you to interact with your data in NetBox directly via LLMs that support MCP. It is read-only by default; with `ENABLE_WRITE=true` it can also stage changes in NetBox Branching branches, never in main. See [Branch-Only Writes](#branch-only-writes).
 
 The server is intentionally simple: easy to get started with, hard to misuse (read-only by default, no plugin surface), and easy to fork and adapt. Forking under Apache 2.0 is a first-class path for users who need capabilities beyond the project's scope.
 
@@ -19,15 +19,17 @@ For chat, use cases, and general MCP discussion, join the NetBox community at [n
 
 | Tool | Description |
 |------|-------------|
-| get_objects | Retrieves NetBox core objects based on their type and filters |
-| get_object_by_id | Gets detailed information about a specific NetBox object by its ID |
-| get_changelogs | Retrieves change history records (audit trail) based on filters |
+| netbox_get_objects | Retrieves NetBox core objects based on their type and filters |
+| netbox_get_object_by_id | Gets detailed information about a specific NetBox object by its ID |
+| netbox_get_changelogs | Retrieves change history records (audit trail) based on filters |
+| netbox_search_objects | Searches names, IPs, serials and other key fields across object types |
+| netbox_list_branches | Lists NetBox Branching branches (read-only; marks your own and writable ones) |
 
 > Note: Core NetBox object types are always available. Plugin object types can be auto-discovered. See [Plugin Object Type Discovery](#plugin-object-type-discovery). Advanced features (GraphQL, dynamic model discovery, etc.) are deliberately out of scope. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full scope statement and rationale.
 
 ## Usage
 
-1. Create a read-only API token in NetBox with sufficient permissions for the tool to access the data you want to make available via MCP.
+1. Create an API token in NetBox with sufficient permissions for the tool to access the data you want to make available via MCP. Use a read-only token unless you enable [Branch-Only Writes](#branch-only-writes), which needs write permissions.
 
 2. Install dependencies:
 
@@ -155,6 +157,130 @@ devices = netbox_get_objects(
 
 The `fields` parameter uses NetBox's native field filtering. See the [NetBox API documentation](https://docs.netbox.dev/en/stable/integrations/rest-api/) for details.
 
+### Branch-Only Writes
+
+With `ENABLE_WRITE=true` the server adds write tools that **only ever write inside a
+[NetBox Branching](https://github.com/netboxlabs/netbox-branching) branch**, never to main:
+
+| Tool | Description |
+|------|-------------|
+| netbox_create_branch | Creates a branch to stage changes in (provisions to `ready` in the background) |
+| netbox_create_objects | Creates one or many objects in a branch |
+| netbox_update_objects | Updates (PATCH) one or many objects in a branch |
+| netbox_delete_objects | Deletes one or many objects in a branch |
+
+Every write tool requires a `branch` (name or schema ID). The server checks that exactly one
+branch matches, that its status is `ready` and that it is owned by the API token's user, then
+sends the request with the `X-NetBox-Branch` header. Set `ALLOW_FOREIGN_BRANCHES=true` to also
+write into other users' branches. `netbox_list_branches` (available in every mode) lists the
+branches. `netbox_list_branches` marks each branch `mine` (owned by the token's user) and `writable` (ready and usable by the write tools now). `netbox_get_objects`, `netbox_get_object_by_id`,
+`netbox_search_objects` and `netbox_get_changelogs` take an optional `branch` to read the
+staged state. There is deliberately no merge tool: review and merge
+branches in the NetBox UI.
+
+Only object types that NetBox Branching actually isolates can be written: `circuits`, `dcim`,
+`ipam`, `tenancy`, `virtualization`, `vpn`, `wireless`, plus `extras.journalentry` and
+`extras.tag`. Other types (users, tokens, permissions, `core`) would be changed in main
+immediately, so they are refused. Config contexts and config templates are refused too, since
+saving one creates or deletes its auto-sync record in main, and so are plugin models, whose side
+effects in main are unknown.
+This is enforced in the NetBox client itself: the only request it will send to main is
+creating a branch.
+
+Deleting an object also deletes users' bookmarks of it, subscriptions to it and jobs attached
+to it (and those of objects deleted with it: a device's interfaces, a location's child and
+grandchild locations), and NetBox Branching doesn't isolate those, so a delete inside a branch
+would remove them from main immediately. `netbox_delete_objects` therefore refuses such
+deletes. Which objects the delete reaches is traced inside the branch, by following the links
+of every bookmarked, subscribed or job-linked object. An inventory item's parent, which the API
+shows only as an ID, is followed too. Other links are looked up with filters from the deleted
+side: a VLAN translation rule's policy, a module bay's hidden parent (which can be stale; a
+deleted device's or module's whole module bay subtree is walked), and the cached region, site
+group, site and location of prefixes, clusters and wireless LANs. The check only sees rows the API token may
+view; if it can't check, or can't see one of those objects, the delete is refused too. It
+counts objects that would only be unlinked (set to null) as deleted, so it also refuses some
+deletes that would remove nothing, e.g. a tenant whose devices have bookmarked interfaces, and
+it refuses when tracing needs more than 2000 lookups. A bookmark or subscription created in
+the moment between the check and the delete is still lost. Tags, journal entries, image
+attachments and contact assignments are branch-isolated.
+
+NetBox also notifies users subscribed to an object whenever it is saved or deleted, including
+inside a branch, and a write saves more objects than it names (a cable's interfaces, a wireless
+link's interfaces). So while anyone is subscribed to a branchable object, every branch write is
+refused.
+
+NetBox also runs **event rules** (webhooks, scripts) for changes made inside a branch, as if
+they had happened in main. So while any enabled event rule covers a branchable object type,
+every branch write is refused, except for rules that only fire on main (below). Plugin models
+and image attachments count, since a delete cascades to them. List the IDs of rules that are
+safe to run on unreviewed branch changes (e.g. a chat notification) in
+`ALLOWED_BRANCH_EVENT_RULES`. `ALLOW_BRANCH_EVENTS=true` allows all event rules and subscriber
+notifications.
+
+**Restricting event rules to main.** netbox-branching can tell event rules whether a change was
+made in a branch. The NetBox operator must configure this; the server can't do it or check it:
+
+1. In NetBox's `configuration.py`, list the plugin's `add_branch_context` **before**
+   `process_event_queue` in `EVENTS_PIPELINE` (list both: NetBox puts `process_event_queue`
+   first if it is missing), then restart NetBox:
+
+   ```python
+   EVENTS_PIPELINE = [
+       'netbox_branching.events.add_branch_context',
+       'extras.events.process_event_queue',
+   ]
+   ```
+
+2. Give each event rule that must not act on branch changes this condition (or add the
+   `active_branch` test to the top-level `and` of its existing conditions):
+
+   ```json
+   {"and": [{"attr": "active_branch", "value": null}]}
+   ```
+
+The server reads each rule's conditions and doesn't count a rule whose top-level `and` contains
+`{"attr": "active_branch", "value": null}` (operator `eq`, not negated). Anything else still
+blocks branch writes: the test under `or`, negated, nested in a sub-group, or missing.
+
+`EVENTS_PIPELINE` isn't visible through the API, so the server trusts that step 1 is done.
+Without it, events carry no `active_branch`: before NetBox 4.3.4 the condition then matches every
+change, so the rule **fires on branch changes after all**; from NetBox 4.3.4 the condition fails
+to evaluate and the rule stops firing entirely, in main too. Check the pipeline before
+relying on these conditions. (This follows netbox-branching's event rule documentation; unlike
+the behaviours below, it hasn't been tested against a live NetBox.)
+
+The event rule, bookmark, subscription and job checks need an API token that sees every row:
+NetBox silently filters API lists by the token user's permission constraints (by default users
+see only their own bookmarks and subscriptions), and the API can't tell, so writes that need
+these checks are refused until you set `UNRESTRICTED_TOKEN=true`. Set it only when the token's
+user can view everything without constraints, e.g. a superuser.
+
+Uploaded files aren't isolated either: changing a device type's front or rear image, or
+deleting a device type that has images, would delete main's image file at once, so both are
+refused. Which models are branchable is read from NetBox at startup;
+if NetBox can't report it, deletes are refused.
+
+These behaviours were verified with netbox-branching 1.1.3 on NetBox 4.5; on other versions the
+server logs a reminder at startup to re-verify them.
+With `TRANSPORT=http`, `ENABLE_WRITE` requires `MCP_AUTH_TOKEN`; the server will not start otherwise.
+
+#### Supported NetBox versions
+
+Branch-only writes work on every NetBox version that netbox-branching supports (4.1 through
+4.7; see its [compatibility matrix](https://github.com/netboxlabs/netbox-branching/blob/main/COMPATIBILITY.md)).
+Some parts depend on the NetBox version:
+
+| NetBox | Token's user (for branch ownership) | Writable models | Deletes |
+|--------|-------------------------------------|-----------------|---------|
+| 4.5+ | Reported by NetBox (`/api/authentication-check/`) | Static allow-list, narrowed to what NetBox reports as branchable | Checked |
+| 4.4 | Set `NETBOX_USERNAME` | Static allow-list, narrowed to what NetBox reports as branchable | Checked |
+| 4.1-4.3 | Set `NETBOX_USERNAME` | Static allow-list | Refused (NetBox can't report branchable models) |
+
+Before NetBox 4.5 there is no API to ask which user owns a token, so set `NETBOX_USERNAME` to
+that user's username. When the server creates a branch, NetBox records the real owner, which
+the server then uses (and warns if `NETBOX_USERNAME` named someone else). Without
+`NETBOX_USERNAME`, writes on these versions need `ALLOW_FOREIGN_BRANCHES=true`.
+
 ## Configuration
 
 The server supports multiple configuration sources with the following precedence (highest to lowest):
@@ -176,6 +302,12 @@ The server supports multiple configuration sources with the following precedence
 | `MCP_AUTH_TOKEN` | String | - | No | Bearer token required on the HTTP endpoint. When unset, the HTTP transport is unauthenticated. Clients send `Authorization: Bearer <token>`. |
 | `VERIFY_SSL` | Boolean | `true` | No | Whether to verify SSL certificates |
 | `ENABLE_PLUGIN_DISCOVERY` | Boolean | `false` | No | Auto-discover plugin object types at startup |
+| `ENABLE_WRITE` | Boolean | `false` | No | Expose branch-only write tools (requires the netbox-branching plugin and a write-capable token). See [Branch-Only Writes](#branch-only-writes). |
+| `ALLOW_FOREIGN_BRANCHES` | Boolean | `false` | No | Let write tools target branches owned by other users |
+| `ALLOW_BRANCH_EVENTS` | Boolean | `false` | No | Let branch writes proceed while enabled event rules (webhooks, scripts) or subscriber notifications would fire on them |
+| `ALLOWED_BRANCH_EVENT_RULES` | List | - | No | Comma-separated IDs of event rules that may fire on branch changes |
+| `UNRESTRICTED_TOKEN` | Boolean | `false` | No | Confirm the API token's user can view everything without permission constraints (e.g. a superuser); required for the checks that read event rules, bookmarks, subscriptions and jobs |
+| `NETBOX_USERNAME` | String | - | NetBox < 4.5 | Username of the API token's user, for branch ownership on NetBox versions that can't report it |
 | `LOG_LEVEL` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` | `INFO` | No | Logging verbosity |
 
 ### Transport Examples

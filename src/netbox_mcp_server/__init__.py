@@ -1,4 +1,4 @@
-"""NetBox MCP Server - Read-only MCP server for NetBox infrastructure data."""
+"""NetBox MCP Server (rw fork) - read-only by default, with branch-only write tools."""
 
 __version__ = "1.2.2"  # Auto-managed by semantic-release
 

@@ -6,9 +6,53 @@ This module provides a base class for NetBox client implementations and a REST A
 """
 
 import abc
+import re
 from typing import Any
 
 import httpx
+
+# The only write allowed without a branch: creating a branch (POST to this endpoint)
+BRANCHES_ENDPOINT = "plugins/branching/branches"
+
+# NetBox Branching only isolates change-logged, non-exempt models. Writes to anything else
+# (users, tokens, permissions, core, bookmarks, branches themselves) land in main
+# immediately even with X-NetBox-Branch set, so branch writes are allow-listed to these
+# endpoint prefixes: the core inventory apps plus the change-logged extras whose writes
+# have no side effects in main. Config contexts and templates are left out: saving one
+# creates or deletes its core.AutoSyncRecord, which lives in main. Plugin models are left
+# out because their side effects in main are unknown.
+BRANCHABLE_ENDPOINT_PREFIXES = (
+    "circuits/",
+    "dcim/",
+    "ipam/",
+    "tenancy/",
+    "virtualization/",
+    "vpn/",
+    "wireless/",
+    "extras/journal-entries/",
+    "extras/tags/",
+)
+
+
+# Plain path segments only: rejects '.', '..', empty and percent-encoded segments, which
+# httpx or the server would normalize into a different endpoint after the prefix check
+_ENDPOINT_PATTERN = re.compile(r"[a-z0-9_-]+(/[a-z0-9_-]+)*")
+
+
+def is_branchable_endpoint(endpoint: str) -> bool:
+    """Whether writes to this endpoint are isolated by NetBox Branching.
+
+    Args:
+        endpoint: API endpoint path, e.g. "dcim/sites" (leading/trailing slashes ignored)
+
+    Returns:
+        True only for plain lowercase path segments (no '.', '..', empty or
+        percent-encoded segments) under one of BRANCHABLE_ENDPOINT_PREFIXES.
+    """
+    endpoint = endpoint.strip("/")
+    if not _ENDPOINT_PATTERN.fullmatch(endpoint):
+        return False
+    return (endpoint + "/").startswith(BRANCHABLE_ENDPOINT_PREFIXES)
 
 
 class NetBoxClientBase(abc.ABC):
@@ -17,7 +61,47 @@ class NetBoxClientBase(abc.ABC):
 
     This class defines the interface for CRUD operations that can be implemented
     either via the REST API or directly via the ORM in a NetBox plugin.
+
+    Every mutating method takes a required keyword-only ``branch``: the schema ID of
+    the NetBox Branching branch to write to. Implementations must build their request
+    headers with _write_headers(), which refuses writes to main (the only exception is
+    creating a branch) and writes to endpoints that branching does not isolate.
     """
+
+    # Endpoints NetBox reports as branchable, set at startup to narrow the static
+    # allow-list; None means only the static BRANCHABLE_ENDPOINT_PREFIXES check applies
+    branchable_endpoints: frozenset[str] | None = None
+
+    def is_writable_endpoint(self, endpoint: str) -> bool:
+        """Whether branch writes to this endpoint are allowed.
+
+        Args:
+            endpoint: API endpoint path, e.g. "dcim/sites"
+
+        Returns:
+            True if the endpoint passes the static allow-list and, when NetBox reported
+            its branchable models, is one of them.
+        """
+        if not is_branchable_endpoint(endpoint):
+            return False
+        return self.branchable_endpoints is None or endpoint.strip("/") in (
+            self.branchable_endpoints
+        )
+
+    def _write_headers(
+        self, method: str, endpoint: str, branch: str | None
+    ) -> dict[str, str] | None:
+        """Return the X-NetBox-Branch header for a write, refusing anything that could hit main."""
+        if method == "create" and branch is None and endpoint.strip("/") == BRANCHES_ENDPOINT:
+            return None
+        if not branch:
+            raise ValueError(f"Refusing to write to main: no branch given for '{endpoint}'")
+        if not self.is_writable_endpoint(endpoint):
+            raise ValueError(
+                f"Refusing to write to '{endpoint}': NetBox Branching does not isolate it, "
+                "so the change would land in main"
+            )
+        return {"X-NetBox-Branch": branch}
 
     @abc.abstractmethod
     def get(
@@ -26,6 +110,7 @@ class NetBoxClientBase(abc.ABC):
         id: int | None = None,
         params: dict[str, Any] | None = None,
         fallback_endpoint: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """
         Retrieve one or more objects from NetBox.
@@ -36,6 +121,7 @@ class NetBoxClientBase(abc.ABC):
             params: Optional query parameters for filtering
             fallback_endpoint: Optional alternative endpoint to try if primary returns 404
                                (used for NetBox version compatibility)
+            headers: Optional extra request headers (e.g. X-NetBox-Branch to read a branch)
 
         Returns:
             For single object queries (with id): Returns the object dict
@@ -48,13 +134,14 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def create(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+    def create(self, endpoint: str, data: dict[str, Any], *, branch: str | None) -> dict[str, Any]:
         """
         Create a new object in NetBox.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: Object data to create
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             The created object as a dict
@@ -62,7 +149,9 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def update(self, endpoint: str, id: int, data: dict[str, Any]) -> dict[str, Any]:
+    def update(
+        self, endpoint: str, id: int, data: dict[str, Any], *, branch: str | None
+    ) -> dict[str, Any]:
         """
         Update an existing object in NetBox.
 
@@ -70,6 +159,7 @@ class NetBoxClientBase(abc.ABC):
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             id: ID of the object to update
             data: Object data to update
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             The updated object as a dict
@@ -77,13 +167,14 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def delete(self, endpoint: str, id: int) -> bool:
+    def delete(self, endpoint: str, id: int, *, branch: str | None) -> bool:
         """
         Delete an object from NetBox.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             id: ID of the object to delete
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             True if deletion was successful, False otherwise
@@ -91,13 +182,16 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def bulk_create(self, endpoint: str, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def bulk_create(
+        self, endpoint: str, data: list[dict[str, Any]], *, branch: str | None
+    ) -> list[dict[str, Any]]:
         """
         Create multiple objects in NetBox.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: List of object data to create
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             List of created objects as dicts
@@ -105,13 +199,16 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def bulk_update(self, endpoint: str, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def bulk_update(
+        self, endpoint: str, data: list[dict[str, Any]], *, branch: str | None
+    ) -> list[dict[str, Any]]:
         """
         Update multiple objects in NetBox.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: List of object data to update (must include ID)
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             List of updated objects as dicts
@@ -119,13 +216,14 @@ class NetBoxClientBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def bulk_delete(self, endpoint: str, ids: list[int]) -> bool:
+    def bulk_delete(self, endpoint: str, ids: list[int], *, branch: str | None) -> bool:
         """
         Delete multiple objects from NetBox.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             ids: List of IDs to delete
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             True if deletion was successful, False otherwise
@@ -197,6 +295,7 @@ class NetBoxRestClient(NetBoxClientBase):
         id: int | None = None,
         params: dict[str, Any] | None = None,
         fallback_endpoint: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """
         Retrieve one or more objects from NetBox via the REST API.
@@ -220,24 +319,25 @@ class NetBoxRestClient(NetBoxClientBase):
             httpx.HTTPStatusError: If the request fails
         """
         url = self._build_url(endpoint, id)
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, headers=headers)
 
         # Try fallback endpoint if primary returns 404
         if response.status_code == 404 and fallback_endpoint:
             fallback_url = self._build_url(fallback_endpoint, id)
-            response = self.session.get(fallback_url, params=params)
+            response = self.session.get(fallback_url, params=params, headers=headers)
 
         response.raise_for_status()
 
         return response.json()
 
-    def create(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+    def create(self, endpoint: str, data: dict[str, Any], *, branch: str | None) -> dict[str, Any]:
         """
         Create a new object in NetBox via the REST API.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: Object data to create
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             The created object as a dict
@@ -246,11 +346,14 @@ class NetBoxRestClient(NetBoxClientBase):
             httpx.HTTPStatusError: If the request fails
         """
         url = self._build_url(endpoint)
-        response = self.session.post(url, json=data)
+        headers = self._write_headers("create", endpoint, branch)
+        response = self.session.post(url, json=data, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def update(self, endpoint: str, id: int, data: dict[str, Any]) -> dict[str, Any]:
+    def update(
+        self, endpoint: str, id: int, data: dict[str, Any], *, branch: str | None
+    ) -> dict[str, Any]:
         """
         Update an existing object in NetBox via the REST API.
 
@@ -258,6 +361,7 @@ class NetBoxRestClient(NetBoxClientBase):
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             id: ID of the object to update
             data: Object data to update
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             The updated object as a dict
@@ -266,17 +370,19 @@ class NetBoxRestClient(NetBoxClientBase):
             httpx.HTTPStatusError: If the request fails
         """
         url = self._build_url(endpoint, id)
-        response = self.session.patch(url, json=data)
+        headers = self._write_headers("update", endpoint, branch)
+        response = self.session.patch(url, json=data, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def delete(self, endpoint: str, id: int) -> bool:
+    def delete(self, endpoint: str, id: int, *, branch: str | None) -> bool:
         """
         Delete an object from NetBox via the REST API.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             id: ID of the object to delete
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             True if deletion was successful, False otherwise
@@ -285,17 +391,21 @@ class NetBoxRestClient(NetBoxClientBase):
             httpx.HTTPStatusError: If the request fails
         """
         url = self._build_url(endpoint, id)
-        response = self.session.delete(url)
+        headers = self._write_headers("delete", endpoint, branch)
+        response = self.session.delete(url, headers=headers)
         response.raise_for_status()
         return response.status_code == 204
 
-    def bulk_create(self, endpoint: str, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def bulk_create(
+        self, endpoint: str, data: list[dict[str, Any]], *, branch: str | None
+    ) -> list[dict[str, Any]]:
         """
         Create multiple objects in NetBox via the REST API.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: List of object data to create
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             List of created objects as dicts
@@ -303,18 +413,22 @@ class NetBoxRestClient(NetBoxClientBase):
         Raises:
             httpx.HTTPStatusError: If the request fails
         """
-        url = f"{self._build_url(endpoint)}bulk/"
-        response = self.session.post(url, json=data)
+        url = self._build_url(endpoint)  # NetBox does bulk operations on the list URL
+        headers = self._write_headers("bulk_create", endpoint, branch)
+        response = self.session.post(url, json=data, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def bulk_update(self, endpoint: str, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def bulk_update(
+        self, endpoint: str, data: list[dict[str, Any]], *, branch: str | None
+    ) -> list[dict[str, Any]]:
         """
         Update multiple objects in NetBox via the REST API.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             data: List of object data to update (must include ID)
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             List of updated objects as dicts
@@ -322,18 +436,20 @@ class NetBoxRestClient(NetBoxClientBase):
         Raises:
             httpx.HTTPStatusError: If the request fails
         """
-        url = f"{self._build_url(endpoint)}bulk/"
-        response = self.session.patch(url, json=data)
+        url = self._build_url(endpoint)  # NetBox does bulk operations on the list URL
+        headers = self._write_headers("bulk_update", endpoint, branch)
+        response = self.session.patch(url, json=data, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def bulk_delete(self, endpoint: str, ids: list[int]) -> bool:
+    def bulk_delete(self, endpoint: str, ids: list[int], *, branch: str | None) -> bool:
         """
         Delete multiple objects from NetBox via the REST API.
 
         Args:
             endpoint: The API endpoint (e.g., 'dcim/sites', 'ipam/prefixes')
             ids: List of IDs to delete
+            branch: Schema ID of the branch to write to (None only to create a branch)
 
         Returns:
             True if deletion was successful, False otherwise
@@ -341,8 +457,9 @@ class NetBoxRestClient(NetBoxClientBase):
         Raises:
             httpx.HTTPStatusError: If the request fails
         """
-        url = f"{self._build_url(endpoint)}bulk/"
+        url = self._build_url(endpoint)  # NetBox does bulk operations on the list URL
+        headers = self._write_headers("bulk_delete", endpoint, branch)
         data = [{"id": id} for id in ids]
-        response = self.session.delete(url, json=data)
+        response = self.session.request("DELETE", url, json=data, headers=headers)
         response.raise_for_status()
         return response.status_code == 204

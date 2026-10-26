@@ -19,10 +19,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 FROM python:3.14-alpine3.24@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
-LABEL org.opencontainers.image.title="NetBox MCP Server" \
-      org.opencontainers.image.description="A read-only MCP server for NetBox" \
-      org.opencontainers.image.url="https://github.com/netboxlabs/netbox-mcp-server" \
-      org.opencontainers.image.source="https://github.com/netboxlabs/netbox-mcp-server" \
+LABEL org.opencontainers.image.title="NetBox MCP Server (rw fork)" \
+      org.opencontainers.image.description="NetBox MCP server, read-only by default with branch-only writes" \
+      org.opencontainers.image.url="https://gitlab.com/avassdal/netbox-mcp-server-rw" \
+      org.opencontainers.image.source="https://gitlab.com/avassdal/netbox-mcp-server-rw" \
       org.opencontainers.image.vendor="NetBox Labs" \
       org.opencontainers.image.licenses="Apache-2.0"
 ENV PYTHONUNBUFFERED=1
