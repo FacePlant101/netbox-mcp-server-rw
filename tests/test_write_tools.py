@@ -22,6 +22,8 @@ from netbox_mcp_server.server import (
     netbox_create_branch,
     netbox_create_objects,
     netbox_delete_objects,
+    netbox_get_changelogs,
+    netbox_get_object_by_id,
     netbox_get_objects,
     netbox_list_branches,
     netbox_search_objects,
@@ -68,8 +70,10 @@ def _reset_branch_policy(monkeypatch):
     monkeypatch.setattr(server, "branch_policy", policy)
 
 
-def _branches(*branches, next_url=None):
-    return {"count": len(branches), "next": next_url, "previous": None, "results": list(branches)}
+def _branches(*branches, next_url=None, count=None):
+    """A page of branches; count is the total across pages, as NetBox reports it."""
+    total = len(branches) if count is None else count
+    return {"count": total, "next": next_url, "previous": None, "results": list(branches)}
 
 
 # ============================================================================
@@ -115,8 +119,8 @@ def test_branch_resolves_by_name_or_schema_id(mock_netbox, branch):
 def test_branch_resolution_filters_and_paginates(mock_netbox):
     """A branch beyond the first page is found; lookups are filtered and minimal."""
     mock_netbox.get.side_effect = [
-        _branches(MERGED, next_url="https://nb/next"),
-        _branches(READY),
+        _branches(MERGED, next_url="https://nb/next", count=2),
+        _branches(READY, count=2),
         {"next": None, "results": []},  # event rules
         {"next": None, "results": []},  # subscriptions
     ]
@@ -659,17 +663,90 @@ def test_search_on_main_still_skips_http_errors(mock_netbox):
 
 @patch("netbox_mcp_server.server.netbox")
 def test_search_error_in_ready_branch_is_skipped_and_rechecked_once(mock_netbox):
+    """The branch is re-checked once, after every type was tried."""
     mock_netbox.get.side_effect = [
         _branches(READY),
         _http_error(400, "bad query"),
-        _branches(READY),
         _http_error(500, "type-specific failure"),
         {"results": [{"id": 1}]},
+        _branches(READY),
     ]
     result = netbox_search_objects(
         "x", object_types=["circuits.circuit", "dcim.rack", "dcim.site"], branch="my-branch"
     )
     assert result == {"circuits.circuit": [], "dcim.rack": [], "dcim.site": [{"id": 1}]}
+    assert mock_netbox.get.call_count == 5
+
+
+@patch("netbox_mcp_server.server.netbox")
+def test_search_catches_branch_merged_after_a_type_specific_error(mock_netbox):
+    """An early per-type 500 doesn't use up the check for a branch merged later."""
+    merged_now = {**READY, "status": {"value": "merged"}}
+    mock_netbox.get.side_effect = [
+        _branches(READY),
+        _http_error(500, "type-specific failure"),
+        {"results": [{"id": 1}]},
+        _http_error(500, "branch merged"),
+        _branches(merged_now),
+    ]
+    with pytest.raises(ValueError, match="has status 'merged'"):
+        netbox_search_objects(
+            "x", object_types=["circuits.circuit", "dcim.rack", "dcim.site"], branch="my-branch"
+        )
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda: netbox_get_objects("dcim.site", {}, branch="my-branch"),
+        lambda: netbox_get_object_by_id("dcim.site", 1, branch="my-branch"),
+        lambda: netbox_get_changelogs({}, branch="my-branch"),
+    ],
+)
+@patch("netbox_mcp_server.server.netbox")
+def test_reads_explain_a_branch_merged_while_cached(mock_netbox, read):
+    merged_now = {**READY, "status": {"value": "merged"}}
+    mock_netbox.get.side_effect = [
+        _branches(READY),
+        _http_error(500, "Server Error"),
+        _branches(merged_now),
+    ]
+    with pytest.raises(ValueError, match="has status 'merged'"):
+        read()
+
+
+@patch("netbox_mcp_server.server.netbox")
+def test_reads_in_a_ready_branch_still_raise_their_own_errors(mock_netbox):
+    mock_netbox.get.side_effect = [_branches(READY), _http_error(404), _branches(READY)]
+    with pytest.raises(httpx.HTTPStatusError):
+        netbox_get_object_by_id("dcim.site", 999, branch="my-branch")
+
+
+@pytest.mark.parametrize("branch", ["backbone", "BRANCH-ID-OTHER-FORMAT"])
+@patch("netbox_mcp_server.server.netbox")
+def test_branch_resolves_by_schema_shaped_name_or_other_schema_id_format(mock_netbox, branch):
+    """'backbone' is a name shaped like a schema ID; the other is a schema ID of another
+    format, found by the fallback listing when no branch has that name."""
+    shaped = {**READY, "name": "backbone", "schema_id": "zzzz0000"}
+    odd = {**READY, "id": 5, "name": "odd", "schema_id": "BRANCH-ID-OTHER-FORMAT"}
+    mock_netbox.get.side_effect = lambda endpoint, params=None, **kw: (
+        _branches(*[b for b in (shaped, odd) if b["name"] == params["name"]])
+        if params and "name" in params
+        else _branches(shaped, odd)
+        if endpoint == "plugins/branching/branches"
+        else {"next": None, "results": []}
+    )
+    netbox_create_objects("dcim.site", branch, {"name": "x", "slug": "x"})
+    expected = "zzzz0000" if branch == "backbone" else "BRANCH-ID-OTHER-FORMAT"
+    assert mock_netbox.create.call_args.kwargs["branch"] == expected
+
+
+def test_get_all_stops_at_count_when_offset_is_ignored():
+    """A proxy that ignores offset returns the same page forever; count bounds the loop."""
+    client = MagicMock()
+    client.get.return_value = {"count": 3, "next": "https://nb/next", "results": [{"id": 1}]}
+    assert len(server._get_all("dcim/sites", {"limit": 1}, client=client)) == 3
+    assert client.get.call_count == 3
 
 
 # ============================================================================

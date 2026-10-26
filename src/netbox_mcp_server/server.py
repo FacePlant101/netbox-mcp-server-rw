@@ -453,10 +453,7 @@ def netbox_get_objects(
         if ordering.strip() != "":
             params["ordering"] = ordering
 
-    headers = _branch_headers(branch)
-
-    # Make API call
-    return netbox.get(endpoint, params=params, fallback_endpoint=fallback, headers=headers)
+    return _read(branch, endpoint, params=params, fallback_endpoint=fallback)
 
 
 @mcp.tool
@@ -512,11 +509,7 @@ def netbox_get_object_by_id(
     if brief:
         params["brief"] = "1"
 
-    headers = _branch_headers(branch)
-
-    return netbox.get(
-        full_endpoint, params=params, fallback_endpoint=full_fallback, headers=headers
-    )
+    return _read(branch, full_endpoint, params=params, fallback_endpoint=full_fallback)
 
 
 @mcp.tool
@@ -579,8 +572,7 @@ def netbox_get_changelogs(filters: dict, branch: str | None = None):
     """
     endpoint = "core/object-changes"
 
-    # Make API call
-    return netbox.get(endpoint, params=filters, headers=_branch_headers(branch))
+    return _read(branch, endpoint, params=filters)
 
 
 @mcp.tool(
@@ -655,7 +647,7 @@ def netbox_search_objects(
 
     results = {obj_type: [] for obj_type in search_types}
     headers = _branch_headers(branch)
-    branch_rechecked = False
+    branch_errors = False
 
     # Build results dictionary (error-resilient)
     for obj_type in search_types:
@@ -674,23 +666,19 @@ def netbox_search_objects(
             # Extract results array from paginated response
             results[obj_type] = response.get("results", [])
         except httpx.HTTPStatusError as e:
-            # In a branch, an error may mean the branch stopped being usable (e.g. merged
-            # mid-search, or while cached as ready): netbox-branching 1.1.3 answers 500
-            # for a branch that isn't ready, 400 for an unknown one. Empty results would
-            # wrongly suggest no matches, so re-check the branch itself once (bypassing
-            # the cache); _resolve_branch raises if it is no longer ready. Other per-type
-            # errors are skipped as on main.
-            status = e.response.status_code
-            if branch and (status == 400 or status >= 500) and not branch_rechecked:
-                branch_rechecked = True
-                branch_policy.cache.pop(branch.strip(), None)
-                _resolve_branch(branch, for_write=False)
+            # Per-type errors are skipped as on main; in a branch, one that may mean the
+            # branch became unusable (e.g. merged mid-search) is re-checked below
+            branch_errors = branch_errors or bool(branch and _is_branch_error(e))
             continue
         except Exception:  # noqa: S112 - intentional error-resilient search
             # Continue searching other types if one fails
             # results[obj_type] already has empty list
             continue
 
+    if branch_errors:
+        # Empty results would wrongly suggest no matches if the branch became unusable
+        # during the search; checked once, after every type was tried
+        _recheck_branch(branch)
     return results
 
 
@@ -817,7 +805,8 @@ def _get_all(
     """Every result of a NetBox list request, following its offset pagination.
 
     NetBox may cap the page size (MAX_PAGE_SIZE) below the requested limit, so pages are
-    followed until "next" is empty.
+    followed until "next" is empty, or "count" results are in (bounding the loop if a
+    proxy ignores the offset).
 
     Args:
         endpoint: API endpoint, e.g. "dcim/devices"
@@ -841,9 +830,10 @@ def _get_all(
         )
         batch = list(page.get("results") or [])
         results.extend(batch)
-        if not page.get("next") or not batch:
-            return results
         offset += len(batch)
+        count = page.get("count")
+        if not page.get("next") or not batch or (isinstance(count, int) and offset >= count):
+            return results
 
 
 def _find_branches(params: dict) -> list[dict]:
@@ -860,14 +850,15 @@ def _lookup_branch(branch: str) -> dict:
         # netbox-branching has no schema_id filter, so input shaped like a schema ID is
         # matched against every branch, by name and schema ID at once: a branch *named*
         # like another branch's schema ID is then ambiguous instead of winning. Other
-        # input can only be a name; it is filtered server-side, but still matched exactly
-        # here so an ignored filter can never select the wrong branch.
-        params = {} if SCHEMA_ID_PATTERN.fullmatch(branch) else {"name": branch}
-        matches = {
-            b["id"]: b
-            for b in _find_branches(params)
-            if branch in (b.get("name"), b.get("schema_id"))
-        }
+        # input is looked up by name (filtered server-side, matched exactly here so an
+        # ignored filter can never select the wrong branch), and if no branch has that
+        # name, against every branch in case it is a schema ID of another format.
+        candidates: list[dict] = []
+        if not SCHEMA_ID_PATTERN.fullmatch(branch):
+            candidates = _find_branches({"name": branch})
+        if not any(b.get("name") == branch for b in candidates):
+            candidates = _find_branches({})
+        matches = {b["id"]: b for b in candidates if branch in (b.get("name"), b.get("schema_id"))}
     except httpx.HTTPStatusError as e:
         _raise_branching_error(e)
     if len(matches) != 1:
@@ -1032,6 +1023,48 @@ def _branch_headers(branch: str | None) -> dict[str, str] | None:
     if not branch:
         return None
     return {"X-NetBox-Branch": _resolve_branch(branch, for_write=False)["schema_id"]}
+
+
+def _is_branch_error(e: httpx.HTTPStatusError) -> bool:
+    """Whether an error reading a branch may mean the branch itself is unusable.
+
+    netbox-branching 1.1.3 answers 500 for a branch that isn't ready (e.g. merged while
+    cached as ready here) and 400 for an unknown one; its messages are translatable, so
+    the status is all there is to go on.
+    """
+    status = e.response.status_code
+    return status == 400 or status >= 500
+
+
+def _recheck_branch(branch: str) -> None:
+    """Look the branch up again, bypassing the cache.
+
+    Raises:
+        ValueError: If it no longer exists or isn't ready (e.g. it was merged).
+    """
+    branch_policy.cache.pop(branch.strip(), None)
+    _resolve_branch(branch, for_write=False)
+
+
+def _read(branch: str | None, endpoint: str, **kwargs: Any) -> Any:
+    """GET from main, or from a ready branch, explaining a branch that became unusable.
+
+    Args:
+        branch: Branch name or schema_id to read from, or None for main
+        endpoint: API endpoint, e.g. "dcim/devices"
+        **kwargs: Passed on to netbox.get (params, fallback_endpoint)
+
+    Raises:
+        ValueError: If the branch is no longer ready (e.g. merged while cached).
+        httpx.HTTPStatusError: For other errors.
+    """
+    headers = _branch_headers(branch)
+    try:
+        return netbox.get(endpoint, headers=headers, **kwargs)
+    except httpx.HTTPStatusError as e:
+        if branch and _is_branch_error(e):
+            _recheck_branch(branch)
+        raise
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
