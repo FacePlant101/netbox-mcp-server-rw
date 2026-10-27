@@ -128,7 +128,10 @@ def test_branch_resolution_filters_and_paginates(mock_netbox):
     first, second = (c.kwargs["params"] for c in mock_netbox.get.call_args_list[:2])
     assert first["name"] == "my-branch"
     assert first["fields"] == "id,name,schema_id,status,owner"
-    assert (first["offset"], second["offset"]) == (0, 1)
+    # Keyset paging: the second page asks for ids above the last one received
+    assert "id__gt" not in first
+    assert "offset" not in first
+    assert second["id__gt"] == MERGED["id"]
     mock_netbox.create.assert_called_once()
 
 
@@ -741,23 +744,28 @@ def test_branch_resolves_by_schema_shaped_name_or_other_schema_id_format(mock_ne
     assert mock_netbox.create.call_args.kwargs["branch"] == expected
 
 
-def test_get_all_orders_by_id_for_stable_paging():
-    """Default orderings (e.g. a job's creation time) can tie; id keeps pages stable."""
+def test_get_all_pages_by_id():
+    """Keyset paging: ordered by id, each page asks for ids above the last one received,
+    so a row deleted mid-read can't shift a later row past a page boundary."""
     client = MagicMock()
     client.get.side_effect = [
-        {"next": "https://nb/next", "results": [{"id": 1}]},
-        {"next": None, "results": [{"id": 2}]},
+        {"next": "https://nb/next", "results": [{"id": 1}, {"id": 4}]},
+        {"next": None, "results": [{"id": 7}]},
     ]
-    assert server._get_all("core/jobs", {"limit": 1}, client=client) == [{"id": 1}, {"id": 2}]
-    assert all(c.kwargs["params"]["ordering"] == "id" for c in client.get.call_args_list)
+    rows = server._get_all("core/jobs", {"limit": 2}, client=client)
+    assert [r["id"] for r in rows] == [1, 4, 7]
+    first, second = (c.kwargs["params"] for c in client.get.call_args_list)
+    assert first["ordering"] == second["ordering"] == "id"
+    assert "id__gt" not in first
+    assert second["id__gt"] == 4
     assert server.SCHEMA_ID_PATTERN.pattern == "[a-z0-9]{8}"
 
 
 def test_get_all_refuses_a_repeated_page():
-    """A proxy that ignores offset repeats page 1: refuse rather than return partial data."""
+    """An ignored id__gt filter repeats page 1: refuse rather than return partial data."""
     client = MagicMock()
     client.get.return_value = {"count": 3, "next": "https://nb/next", "results": [{"id": 1}]}
-    with pytest.raises(ValueError, match="same page"):
+    with pytest.raises(ValueError, match="didn't advance"):
         server._get_all("dcim/sites", {"limit": 1}, client=client)
     assert client.get.call_count == 2
 
@@ -768,7 +776,7 @@ def test_event_rule_check_refuses_when_pages_repeat(mock_netbox):
     mock_netbox.get.side_effect = lambda endpoint, **kw: (
         rule_page if endpoint == "extras/event-rules" else _branches(READY)
     )
-    with pytest.raises(ValueError, match="same page"):
+    with pytest.raises(ValueError, match="didn't advance"):
         netbox_create_objects("dcim.site", "my-branch", {"name": "x", "slug": "x"})
     mock_netbox.create.assert_not_called()
 
@@ -1643,11 +1651,10 @@ def test_batched_fetch_follows_pages_when_netbox_caps_page_size(mock_netbox):
         if endpoint == "dcim/devices":
             return {"next": None, "results": [{"id": i} for i in params["id"]]}
         if endpoint == "dcim/interfaces":
-            wanted = [objects[i] for i in params["id"]]
-            offset = params.get("offset", 0)
-            page = wanted[offset : offset + 2]  # MAX_PAGE_SIZE = 2
-            more = offset + 2 < len(wanted)
-            return {"next": "http://nb/next" if more else None, "results": page}
+            after = params.get("id__gt", 0)
+            wanted = [objects[i] for i in sorted(params["id"]) if i > after]
+            page = wanted[:2]  # MAX_PAGE_SIZE = 2
+            return {"next": "http://nb/next" if len(wanted) > 2 else None, "results": page}
         if endpoint == "extras/bookmarks":
             return {"next": None, "results": rows}
         if endpoint in ("extras/subscriptions", "core/jobs", "extras/event-rules"):

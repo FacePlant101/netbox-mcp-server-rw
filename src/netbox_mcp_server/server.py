@@ -803,50 +803,48 @@ def _get_all(
     client: NetBoxRestClient | None = None,
     fallback_endpoint: str | None = None,
 ) -> list[dict]:
-    """Every result of a NetBox list request, following its offset pagination.
+    """Every result of a NetBox list request, paged by id (keyset pagination).
 
-    NetBox may cap the page size (MAX_PAGE_SIZE) below the requested limit, so pages are
-    followed until "next" is empty. Rows are ordered by id so offset paging is stable
-    (default orderings such as a job's creation time can tie, and tied rows could then
-    move between pages and be skipped). Every row must carry an "id": a page that adds no
-    new id (e.g. a proxy ignoring the offset and repeating a page) is refused, since the
-    callers' safety checks must not pass on a partial list.
+    Rows are ordered by id and each page asks for ids above the last one received, so a
+    row deleted or added mid-read can't shift later rows past a page boundary (offset
+    paging would skip one). NetBox may cap the page size (MAX_PAGE_SIZE) below the
+    requested limit, so pages are followed until "next" is empty. Every row must carry
+    an "id". A page that doesn't advance (e.g. an endpoint or proxy ignoring the id__gt
+    filter) is refused, since the callers' safety checks must not pass on a partial
+    list.
 
     Args:
         endpoint: API endpoint, e.g. "dcim/devices"
-        params: Query parameters (filters, fields, limit); ordering by id and offset are
-            added
+        params: Query parameters (filters, fields, limit); ordering and id__gt are added
         headers: Optional extra request headers (e.g. X-NetBox-Branch)
         client: NetBox client to use (default: the server's client)
         fallback_endpoint: Optional endpoint to try if the primary returns 404
 
     Raises:
         httpx.HTTPStatusError: If NetBox returns an error status.
-        ValueError: If a page repeats earlier rows, so the full list can't be read.
+        ValueError: If paging doesn't advance, so the full list can't be read.
     """
     client = client or netbox
     results: list[dict] = []
-    seen: set[Any] = set()
-    offset = 0
+    after: int | None = None
     while True:
+        page_params = {**params, "ordering": "id"}
+        if after is not None:
+            page_params["id__gt"] = after
         page = client.get(
-            endpoint,
-            params={**params, "ordering": "id", "offset": offset},
-            headers=headers,
-            fallback_endpoint=fallback_endpoint,
+            endpoint, params=page_params, headers=headers, fallback_endpoint=fallback_endpoint
         )
         batch = list(page.get("results") or [])
-        ids = {row.get("id") for row in batch}
-        if batch and ids <= seen:
-            raise ValueError(
-                f"NetBox returned the same page of /api/{endpoint}/ again (is a proxy "
-                "ignoring the 'offset' parameter?), so the full list can't be read; refusing."
-            )
-        seen |= ids
         results.extend(batch)
         if not page.get("next") or not batch:
             return results
-        offset += len(batch)
+        last = max(row["id"] for row in batch)
+        if after is not None and last <= after:
+            raise ValueError(
+                f"Paging /api/{endpoint}/ by id didn't advance (is the 'id__gt' filter being "
+                "ignored?), so the full list can't be read; refusing."
+            )
+        after = last
 
 
 def _find_branches(params: dict) -> list[dict]:
