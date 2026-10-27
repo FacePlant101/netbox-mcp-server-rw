@@ -741,6 +741,18 @@ def test_branch_resolves_by_schema_shaped_name_or_other_schema_id_format(mock_ne
     assert mock_netbox.create.call_args.kwargs["branch"] == expected
 
 
+def test_get_all_orders_by_id_for_stable_paging():
+    """Default orderings (e.g. a job's creation time) can tie; id keeps pages stable."""
+    client = MagicMock()
+    client.get.side_effect = [
+        {"next": "https://nb/next", "results": [{"id": 1}]},
+        {"next": None, "results": [{"id": 2}]},
+    ]
+    assert server._get_all("core/jobs", {"limit": 1}, client=client) == [{"id": 1}, {"id": 2}]
+    assert all(c.kwargs["params"]["ordering"] == "id" for c in client.get.call_args_list)
+    assert server.SCHEMA_ID_PATTERN.pattern == "[a-z0-9]{8}"
+
+
 def test_get_all_refuses_a_repeated_page():
     """A proxy that ignores offset repeats page 1: refuse rather than return partial data."""
     client = MagicMock()

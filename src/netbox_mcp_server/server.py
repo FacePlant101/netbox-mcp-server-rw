@@ -742,8 +742,8 @@ BRANCH_CACHE_TTL = 60.0
 # NetBox Branching schema IDs are eight lowercase alphanumeric characters. Inputs of this
 # shape are matched by both name and schema ID, so a name can never shadow another
 # branch's schema ID. The column holds at most 8 characters in any format.
-SCHEMA_ID_PATTERN = re.compile(r"[a-z0-9]{8}")
 SCHEMA_ID_MAX_LENGTH = 8
+SCHEMA_ID_PATTERN = re.compile(rf"[a-z0-9]{{{SCHEMA_ID_MAX_LENGTH}}}")
 
 # How long a failed lookup of the token's user is remembered before retrying
 USER_LOOKUP_RETRY_SECONDS = 60.0
@@ -806,13 +806,16 @@ def _get_all(
     """Every result of a NetBox list request, following its offset pagination.
 
     NetBox may cap the page size (MAX_PAGE_SIZE) below the requested limit, so pages are
-    followed until "next" is empty. Every row must carry an "id": a page that adds no
+    followed until "next" is empty. Rows are ordered by id so offset paging is stable
+    (default orderings such as a job's creation time can tie, and tied rows could then
+    move between pages and be skipped). Every row must carry an "id": a page that adds no
     new id (e.g. a proxy ignoring the offset and repeating a page) is refused, since the
     callers' safety checks must not pass on a partial list.
 
     Args:
         endpoint: API endpoint, e.g. "dcim/devices"
-        params: Query parameters (filters, fields, limit); offset is added per page
+        params: Query parameters (filters, fields, limit); ordering by id and offset are
+            added
         headers: Optional extra request headers (e.g. X-NetBox-Branch)
         client: NetBox client to use (default: the server's client)
         fallback_endpoint: Optional endpoint to try if the primary returns 404
@@ -828,7 +831,7 @@ def _get_all(
     while True:
         page = client.get(
             endpoint,
-            params={**params, "offset": offset},
+            params={**params, "ordering": "id", "offset": offset},
             headers=headers,
             fallback_endpoint=fallback_endpoint,
         )
