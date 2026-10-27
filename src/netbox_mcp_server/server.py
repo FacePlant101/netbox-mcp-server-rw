@@ -838,13 +838,15 @@ def _get_all(
         results.extend(batch)
         if not page.get("next") or not batch:
             return results
-        last = max(row["id"] for row in batch)
-        if after is not None and last <= after:
+        # The next page starts after this page's last id, which skips nothing only if the
+        # page is in ascending id order and above the previous one
+        ids = [row["id"] for row in batch]
+        if ids != sorted(set(ids)) or (after is not None and ids[0] <= after):
             raise ValueError(
-                f"Paging /api/{endpoint}/ by id didn't advance (is the 'id__gt' filter being "
-                "ignored?), so the full list can't be read; refusing."
+                f"Paging /api/{endpoint}/ by id didn't advance in id order (is the 'ordering' "
+                "or 'id__gt' parameter being ignored?), so the full list can't be read; refusing."
             )
-        after = last
+        after = ids[-1]
 
 
 def _find_branches(params: dict) -> list[dict]:

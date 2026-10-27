@@ -761,6 +761,15 @@ def test_get_all_pages_by_id():
     assert server.SCHEMA_ID_PATTERN.pattern == "[a-z0-9]{8}"
 
 
+def test_get_all_refuses_a_page_out_of_id_order():
+    """If ordering=id is ignored, id__gt=<max id> would skip lower ids; refuse instead."""
+    client = MagicMock()
+    client.get.return_value = {"next": "https://nb/next", "results": [{"id": 9}, {"id": 2}]}
+    with pytest.raises(ValueError, match="didn't advance in id order"):
+        server._get_all("core/jobs", {"limit": 2}, client=client)
+    assert client.get.call_count == 1
+
+
 def test_get_all_refuses_a_repeated_page():
     """An ignored id__gt filter repeats page 1: refuse rather than return partial data."""
     client = MagicMock()
