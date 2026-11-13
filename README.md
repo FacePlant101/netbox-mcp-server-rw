@@ -1,6 +1,6 @@
 # NetBox MCP Server
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/faceplant101-netbox-mcp-server-rw-ao1twa)](https://m8ven.ai/mcp/faceplant101-netbox-mcp-server-rw-ao1twa?s=readme)
+[![M8ven Score](https://m8ven.ai/badge/mcp/faceplant101-netbox-mcp-server-rw-ao1twa?v=38c2440bbc330fa24fef49f5b524ad03)](https://m8ven.ai/mcp/faceplant101-netbox-mcp-server-rw-ao1twa?s=readme)
 
 > **⚠️ Breaking Change in v1.0.0**: The project structure has changed.
 > If upgrading from v0.1.0, update your configuration:
