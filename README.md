@@ -1,5 +1,7 @@
 # NetBox MCP Server
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/faceplant101-netbox-mcp-server-rw-ao1twa)](https://m8ven.ai/mcp/faceplant101-netbox-mcp-server-rw-ao1twa?s=readme)
+
 > **⚠️ Breaking Change in v1.0.0**: The project structure has changed.
 > If upgrading from v0.1.0, update your configuration:
 > - Change `uv run server.py` to `uv run netbox-mcp-server`
@@ -537,3 +539,5 @@ If your use case needs capabilities outside this project's scope, forking under 
 ## License
 
 This project is licensed under the Apache 2.0 license.  See the LICENSE file for details.
+
+
