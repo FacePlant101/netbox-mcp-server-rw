@@ -1,4 +1,5 @@
 # CODEOWNERS - Require review from maintainers for critical files
-/.github/workflows/ @netboxlabs/eng-ai
-/pyproject.toml @netboxlabs/eng-ai
-/.github/CODEOWNERS @netboxlabs/eng-ai
+/.github/workflows/ @FacePlant101
+/.github/dependabot.yml @FacePlant101
+/pyproject.toml @FacePlant101
+/.github/CODEOWNERS @FacePlant101
