@@ -177,3 +177,38 @@ def test_configure_logging_shows_http_clients_at_debug():
     assert root_logger.level == logging.DEBUG
     assert urllib3_logger.level == logging.DEBUG
     assert httpx_logger.level == logging.DEBUG
+
+
+# ===== Server Instructions Tests =====
+
+
+def test_instructions_read_from_env(monkeypatch):
+    """MCP_INSTRUCTIONS is read from the environment, trimmed."""
+    monkeypatch.setenv("MCP_INSTRUCTIONS", "  Site notes.  ")
+    settings = Settings(
+        netbox_url="https://netbox.example.com/", netbox_token="tok", _env_file=None
+    )
+    assert settings.mcp_instructions == "Site notes."
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_blank_instructions_normalized_to_none(blank):
+    """Empty MCP_INSTRUCTIONS counts as unset."""
+    settings = Settings(
+        netbox_url="https://netbox.example.com/",
+        netbox_token="tok",
+        mcp_instructions=blank,
+        _env_file=None,
+    )
+    assert settings.mcp_instructions is None
+
+
+def test_parse_cli_args_mcp_instructions():
+    """--mcp-instructions maps to the mcp_instructions overlay key."""
+    original_argv = sys.argv
+    try:
+        sys.argv = ["server.py", "--mcp-instructions", "Site notes."]
+        result = parse_cli_args()
+        assert result["mcp_instructions"] == "Site notes."
+    finally:
+        sys.argv = original_argv

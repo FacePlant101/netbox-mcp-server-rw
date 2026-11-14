@@ -228,8 +228,8 @@ made in a branch. The NetBox operator must configure this; the server can't do i
 
    ```python
    EVENTS_PIPELINE = [
-       'netbox_branching.events.add_branch_context',
-       'extras.events.process_event_queue',
+       "netbox_branching.events.add_branch_context",
+       "extras.events.process_event_queue",
    ]
    ```
 
@@ -309,8 +309,20 @@ The server supports multiple configuration sources with the following precedence
 | `ALLOW_BRANCH_EVENTS` | Boolean | `false` | No | Let branch writes proceed while enabled event rules (webhooks, scripts) or subscriber notifications would fire on them |
 | `ALLOWED_BRANCH_EVENT_RULES` | List | - | No | Comma-separated IDs of event rules that may fire on branch changes |
 | `UNRESTRICTED_TOKEN` | Boolean | `false` | No | Confirm the API token's user can view everything without permission constraints (e.g. a superuser); required for the checks that read event rules, bookmarks, subscriptions and jobs |
+| `MCP_INSTRUCTIONS` | String | - | No | Extra text for the instructions clients get when they connect. See [Server Instructions](#server-instructions). |
 | `NETBOX_USERNAME` | String | - | NetBox < 4.5 | Username of the API token's user, for branch ownership on NetBox versions that can't report it |
 | `LOG_LEVEL` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` | `INFO` | No | Logging verbosity |
+
+### Server Instructions
+
+When a client connects, the server sends MCP instructions: which tool to use for what, and with
+`ENABLE_WRITE=true` the branch workflow. Clients such as Claude Code show them to the model.
+`MCP_INSTRUCTIONS` adds your own text after them, for what only you know: what this NetBox
+holds, which other systems are the source of truth for what, and site conventions.
+
+```bash
+MCP_INSTRUCTIONS="This NetBox is the source of truth for every IP address and DNS name: a webhook creates the DNS records from it."
+```
 
 ### Transport Examples
 
