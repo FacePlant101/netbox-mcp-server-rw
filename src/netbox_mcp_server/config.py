@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     see only their own bookmarks and subscriptions) and the API can't tell, so the checks
     that read event rules, bookmarks, subscriptions and jobs refuse until this is set"""
 
+    mcp_instructions: str | None = None
+    """Extra text for the instructions clients get when they connect, after the built-in
+    description of the tools (e.g. what this NetBox holds and how the site uses it)"""
+
     netbox_username: str | None = None
     """Username of the API token's user; needed for branch ownership on NetBox < 4.5,
     which can't report it (newer versions ask NetBox and ignore this)"""
@@ -127,6 +131,14 @@ class Settings(BaseSettings):
         if not isinstance(items, list):
             return v
         return [part.strip() for item in items for part in str(item).split(",") if part.strip()]
+
+    @field_validator("mcp_instructions", mode="after")
+    @classmethod
+    def normalize_instructions(cls, v: str | None) -> str | None:
+        """Treat empty or whitespace-only instructions as unset."""
+        if v is None or not v.strip():
+            return None
+        return v.strip()
 
     @field_validator("netbox_username", mode="after")
     @classmethod
@@ -184,6 +196,9 @@ class Settings(BaseSettings):
             "allowed_branch_event_rules": self.allowed_branch_event_rules,
             "unrestricted_token": self.unrestricted_token,
             "netbox_username": self.netbox_username,
+            "mcp_instructions": f"{len(self.mcp_instructions)} characters"
+            if self.mcp_instructions
+            else None,
             "log_level": self.log_level,
         }
         if self.transport == "http":

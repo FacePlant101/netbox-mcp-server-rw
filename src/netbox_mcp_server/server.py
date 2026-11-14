@@ -115,6 +115,12 @@ def parse_cli_args() -> dict[str, Any]:
         help="Expose create/update/delete tools (requires a write-capable token)",
     )
     parser.add_argument(
+        "--mcp-instructions",
+        type=str,
+        dest="mcp_instructions",
+        help="Extra text for the instructions clients get when they connect",
+    )
+    parser.add_argument(
         "--netbox-username",
         type=str,
         dest="netbox_username",
@@ -180,6 +186,8 @@ def parse_cli_args() -> dict[str, Any]:
         overlay["enable_plugin_discovery"] = args.enable_plugin_discovery
     if args.enable_write is not None:
         overlay["enable_write"] = args.enable_write
+    if args.mcp_instructions is not None:
+        overlay["mcp_instructions"] = args.mcp_instructions
     if args.netbox_username is not None:
         overlay["netbox_username"] = args.netbox_username
     if args.allow_branch_events is not None:
@@ -254,7 +262,44 @@ DEFAULT_SEARCH_TYPES = [
     "virtualization.virtualmachine",  # VM names
 ]
 
-mcp = FastMCP("NetBox")
+READ_INSTRUCTIONS = """\
+NetBox documents the network and infrastructure as intended: sites, racks, devices, interfaces,
+cables, IP addresses, prefixes, VLANs, VRFs, virtual machines, circuits and tenants. Use it to
+find what exists, where it is and how it is connected. It does not show live state (whether a
+device is up, what a guest is running).
+- A name, address or serial without knowing its type: netbox_search_objects.
+- A known type with filters: netbox_get_objects; pass fields or brief to keep results small,
+  and page with limit and offset. One object by ID: netbox_get_object_by_id.
+- Who changed what and when: netbox_get_changelogs.
+- netbox_list_branches lists NetBox Branching branches; the read tools take a branch to read
+  inside one instead of main."""
+
+WRITE_INSTRUCTIONS = """\
+Changes are made only inside NetBox Branching branches, never in main: use one of your branches
+from netbox_list_branches or make one with netbox_create_branch (wait until it is ready), then
+netbox_create_objects, netbox_update_objects and netbox_delete_objects with that branch. A person
+reviews and merges the branch in the NetBox UI; there is no merge tool."""
+
+
+def build_instructions(write_enabled: bool, extra: str | None) -> str:
+    """Build the instructions clients get when they connect.
+
+    Args:
+        write_enabled: Whether the branch-only write tools are exposed
+        extra: Site-specific text from MCP_INSTRUCTIONS, appended last (or None)
+
+    Returns:
+        The tool overview, the branch workflow when writes are on, then the extra text
+    """
+    parts = [READ_INSTRUCTIONS]
+    if write_enabled:
+        parts.append(WRITE_INSTRUCTIONS)
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
+
+
+mcp = FastMCP("NetBox", instructions=build_instructions(write_enabled=False, extra=None))
 netbox = None
 
 
@@ -2221,6 +2266,8 @@ def main() -> None:
         warn_if_unverified_versions(netbox)
         register_write_tools()
         logger.warning("Write tools enabled: changes can be made inside NetBox Branching branches")
+
+    mcp.instructions = build_instructions(settings.enable_write, settings.mcp_instructions)
 
     if settings.enable_plugin_discovery:
         plugin_types = discover_plugin_types(netbox)

@@ -1,29 +1,56 @@
+# Dependabot version updates. Mirrors renovate.json5: grouped minor/patch
+# updates, majors on their own, 7-day release age, chore(deps) commits.
+# Security updates are not delayed by cooldown.
 version: 2
+
 updates:
-  # Python dependencies (uv / pyproject.toml + uv.lock)
-  - package-ecosystem: "uv"
-    directory: "/"
+  - package-ecosystem: uv
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    labels: [dependencies]
     commit-message:
-      prefix: "chore(deps)"
-      prefix-development: "chore(deps-dev)"
+      prefix: chore
+      include: scope
+    groups:
+      python-non-major:
+        update-types: [minor, patch]
 
-  # GitHub Actions workflows
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    labels: [dependencies]
     commit-message:
-      prefix: "ci(deps)"
+      prefix: ci
+      include: scope
+    groups:
+      actions-non-major:
+        update-types: [minor, patch]
 
-  # Dockerfile base images
-  - package-ecosystem: "docker"
-    directory: "/"
+  - package-ecosystem: docker
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    labels: [dependencies]
     commit-message:
-      prefix: "chore(deps)"
+      prefix: chore
+      include: scope
+    groups:
+      docker-non-major:
+        update-types: [minor, patch]
