@@ -1,5 +1,5 @@
-# Dependabot version updates. Mirrors renovate.json5: grouped minor/patch
-# updates, majors on their own, 7-day release age, chore(deps) commits.
+# Dependabot version updates: grouped minor/patch updates, majors on their
+# own, 7-day release age, chore(deps) commits.
 # Security updates are not delayed by cooldown.
 version: 2
 
