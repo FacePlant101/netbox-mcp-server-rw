@@ -47,7 +47,7 @@ def test_client_receives_instructions():
 
     async def initialize() -> str | None:
         async with Client(mcp) as client:
-            return client.initialize_result.instructions
+            return client.instructions
 
     original = mcp.instructions
     try:
