@@ -248,8 +248,10 @@ blocks branch writes: the test under `or`, negated, nested in a sub-group, or mi
 Without it, events carry no `active_branch`: before NetBox 4.3.4 the condition then matches every
 change, so the rule **fires on branch changes after all**; from NetBox 4.3.4 the condition fails
 to evaluate and the rule stops firing entirely, in main too. Check the pipeline before
-relying on these conditions. (This follows netbox-branching's event rule documentation; unlike
-the behaviours below, it hasn't been tested against a live NetBox.)
+relying on these conditions. Verified with netbox-branching 1.1.3 on NetBox 4.5.10: with the
+pipeline entry, a main-only rule stays silent for branch changes and fires for changes in main;
+without it, the rule never fires (NetBox logs `Invalid key path: active_branch`). The behaviour
+before NetBox 4.3.4 follows from NetBox's code and hasn't been tested live.
 
 The event rule, bookmark, subscription and job checks need an API token that sees every row:
 NetBox silently filters API lists by the token user's permission constraints (by default users
